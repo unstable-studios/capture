@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ts="$(date +"%Y%m%d-%H%M%S")"
+OUT="${1:-$PWD/dev-config-snapshot-$ts}"
+mkdir -p "$OUT"
+
+log() { printf "\n==> %s\n" "$*"; }
+
+copy_if_exists() {
+  local src="$1"
+  local dest="$2"
+  if [ -e "$src" ]; then
+    mkdir -p "$(dirname "$dest")"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --copy-links --safe-links "$src" "$dest" 2>/dev/null || true
+    else
+      cp -a "$src" "$dest" 2>/dev/null || true
+    fi
+  fi
+}
+
+run_if_cmd() {
+  local cmd="$1"
+  local outfile="$2"
+  shift 2 || true
+  if command -v "$cmd" >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$outfile")"
+    ( "$cmd" "$@" ) >"$outfile" 2>&1 || true
+  fi
+}
+
+redact_file_in_place() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  perl -0777 -i -pe '
+    s/(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/$1[REDACTED]/gi;
+    s/(\btoken\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
+    s/(\bpassword\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
+    s/(\bsecret\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
+    s/-----BEGIN (?:OPENSSH|RSA|EC|DSA|PRIVATE) KEY-----.+?-----END (?:OPENSSH|RSA|EC|DSA|PRIVATE) KEY-----/-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----/gs;
+  ' "$f" 2>/dev/null || true
+}
+
+OS="$(uname -s || true)"
+HOME_DIR="${HOME:-}"
+
+log "Writing snapshot to: $OUT"
+printf "timestamp=%s\nos=%s\nhostname=%s\nuser=%s\n" \
+  "$ts" "$OS" "$(hostname 2>/dev/null || true)" "$(whoami 2>/dev/null || true)" \
+  > "$OUT/metadata.txt"
+
+# -------------------------
+# Git
+# -------------------------
+log "Capturing Git configuration"
+run_if_cmd git "$OUT/git/version.txt" --version
+run_if_cmd git "$OUT/git/config--global.txt" config --global --list --show-origin
+run_if_cmd git "$OUT/git/config--system.txt" config --system --list --show-origin
+run_if_cmd git "$OUT/git/config--list.txt" config --list --show-origin
+copy_if_exists "$HOME_DIR/.gitconfig" "$OUT/git/files/.gitconfig"
+copy_if_exists "$HOME_DIR/.config/git/config" "$OUT/git/files/.config/git/config"
+copy_if_exists "/etc/gitconfig" "$OUT/git/files/etc-gitconfig"
+redact_file_in_place "$OUT/git/config--global.txt"
+redact_file_in_place "$OUT/git/config--system.txt"
+redact_file_in_place "$OUT/git/config--list.txt"
+
+# -------------------------
+# SSH (no private keys)
+# -------------------------
+log "Capturing SSH configuration (no private keys)"
+copy_if_exists "$HOME_DIR/.ssh/config" "$OUT/ssh/config"
+copy_if_exists "$HOME_DIR/.ssh/known_hosts" "$OUT/ssh/known_hosts"
+copy_if_exists "$HOME_DIR/.ssh/authorized_keys" "$OUT/ssh/authorized_keys"
+if [ -d "$HOME_DIR/.ssh" ]; then
+  mkdir -p "$OUT/ssh/public_keys"
+  shopt -s nullglob
+  for pub in "$HOME_DIR/.ssh/"*.pub; do
+    cp -a "$pub" "$OUT/ssh/public_keys/" 2>/dev/null || true
+  done
+  shopt -u nullglob
+fi
+redact_file_in_place "$OUT/ssh/config"
+
+# -------------------------
+# Shell / Zsh / Oh-My-Zsh
+# -------------------------
+log "Capturing shell configuration (raw + declarative essence)"
+mkdir -p "$OUT/shell/raw" "$OUT/shell/essence" "$OUT/shell/omz"
+
+# Raw dotfiles (forensics)
+copy_if_exists "$HOME_DIR/.bashrc" "$OUT/shell/raw/.bashrc"
+copy_if_exists "$HOME_DIR/.bash_profile" "$OUT/shell/raw/.bash_profile"
+copy_if_exists "$HOME_DIR/.profile" "$OUT/shell/raw/.profile"
+copy_if_exists "$HOME_DIR/.zshrc" "$OUT/shell/raw/.zshrc"
+copy_if_exists "$HOME_DIR/.zprofile" "$OUT/shell/raw/.zprofile"
+copy_if_exists "$HOME_DIR/.zshenv" "$OUT/shell/raw/.zshenv"
+copy_if_exists "$HOME_DIR/.config/fish/config.fish" "$OUT/shell/raw/fish/config.fish"
+copy_if_exists "$HOME_DIR/.config/starship.toml" "$OUT/shell/raw/starship.toml"
+
+# Oh My Zsh (capture intent, not the whole framework)
+# If ZSH env var isn’t set, default OMZ install path.
+OMZ_DIR="${ZSH:-$HOME_DIR/.oh-my-zsh}"
+if [ -d "$OMZ_DIR" ]; then
+  printf "found=true\npath=%s\n" "$OMZ_DIR" > "$OUT/shell/omz/oh-my-zsh.txt"
+  # Capture custom dir if present
+  ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME_DIR/.oh-my-zsh/custom}"
+  if [ -d "$ZSH_CUSTOM" ]; then
+    printf "custom_path=%s\n" "$ZSH_CUSTOM" >> "$OUT/shell/omz/oh-my-zsh.txt"
+    # These are "yours"—safe to snapshot.
+    copy_if_exists "$ZSH_CUSTOM/themes" "$OUT/shell/omz/custom/themes"
+    copy_if_exists "$ZSH_CUSTOM/plugins" "$OUT/shell/omz/custom/plugins"
+  fi
+else
+  echo "found=false" > "$OUT/shell/omz/oh-my-zsh.txt"
+fi
+
+# Declarative essence extractor for .zshrc
+# Goal: a rebuild recipe you can reapply, not a byte-for-byte copy.
+ESS="$OUT/shell/essence/zshrc-essence.md"
+ZSHRC="$HOME_DIR/.zshrc"
+
+{
+  echo "# Zsh Essence ($ts)"
+  echo
+  echo "This is a best-effort extraction of the *intent* of ~/.zshrc:"
+  echo "- Oh-My-Zsh theme/plugins (if present)"
+  echo "- PATH mutations (normalized)"
+  echo "- Aliases (optional; included here)"
+  echo "- Selected env vars (filtered)"
+  echo
+} > "$ESS"
+
+if [ -f "$ZSHRC" ]; then
+  # OMZ theme
+  THEME="$(grep -E '^\s*ZSH_THEME=' "$ZSHRC" 2>/dev/null | tail -n1 | sed -E 's/^\s*ZSH_THEME=//')"
+  # OMZ plugins: handle plugins=(a b c) even across whitespace
+  PLUGINS_LINE="$(perl -ne 'if(/^\s*plugins=\(([^)]*)\)/){print "$1\n";}' "$ZSHRC" | tail -n1)"
+
+  {
+    echo "## Oh My Zsh"
+    echo
+    if [ -n "${THEME:-}" ]; then
+      echo "- ZSH_THEME: \`$THEME\`"
+    else
+      echo "- ZSH_THEME: (not detected)"
+    fi
+    if [ -n "${PLUGINS_LINE:-}" ]; then
+      # normalize plugin list
+      PLUGINS_NORM="$(echo "$PLUGINS_LINE" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+      echo "- plugins: \`($PLUGINS_NORM)\`"
+    else
+      echo "- plugins: (not detected)"
+    fi
+    echo
+  } >> "$ESS"
+
+  # PATH mutations: capture lines that export PATH or path+=
+  {
+    echo "## PATH mutations (review + normalize)"
+    echo
+    echo "```zsh"
+    grep -E '(^|\s)(export\s+PATH=|PATH=|path\+\=|typeset\s+\-U\s+path)' "$ZSHRC" 2>/dev/null \
+      | sed -E 's/[[:space:]]+$//' \
+      | head -n 200
+    echo "```"
+    echo
+  } >> "$ESS"
+
+  # Aliases: capture simple alias lines (not perfect, but useful)
+  {
+    echo "## Aliases"
+    echo
+    echo "```zsh"
+    grep -E '^\s*alias\s+[A-Za-z0-9_+-]+=' "$ZSHRC" 2>/dev/null \
+      | sed -E 's/[[:space:]]+$//' \
+      | head -n 400
+    echo "```"
+    echo
+  } >> "$ESS"
+
+  # Env vars: capture exports but avoid obvious secret-ish keys
+  {
+    echo "## Selected exported env vars (filtered)"
+    echo
+    echo "```zsh"
+    grep -E '^\s*export\s+[A-Za-z_][A-Za-z0-9_]*=' "$ZSHRC" 2>/dev/null \
+      | grep -Ev '(SECRET|TOKEN|PASSWORD|KEY|PRIVATE|BEARER|AUTH|AWS_SECRET|GITHUB_TOKEN|OPENAI|DOPPLER|1PASSWORD|OP_SESSION|NPM_TOKEN)' \
+      | sed -E 's/[[:space:]]+$//' \
+      | head -n 200
+    echo "```"
+    echo
+  } >> "$ESS"
+
+else
+  echo "_No ~/.zshrc found._" >> "$ESS"
+fi
+
+redact_file_in_place "$OUT/shell/raw/.zshrc"
+redact_file_in_place "$ESS"
+
+# -------------------------
+# Source URLs for external libs/plugins (best-effort)
+# -------------------------
+log "Capturing source URLs for external shell libs/plugins (best-effort)"
+mkdir -p "$OUT/shell/sources"
+
+ZSH_SOURCES_MD="$OUT/shell/sources/zsh-sources.md"
+ZSH_GIT_ORIGINS="$OUT/shell/sources/git-origins.txt"
+
+# helper: if dir is a git repo, record its origin
+record_git_origin() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  if [ -d "$dir/.git" ] || git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local origin
+    origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+    if [ -n "$origin" ]; then
+      printf "%s\t%s\n" "$dir" "$origin" >> "$ZSH_GIT_ORIGINS"
+    fi
+  fi
+}
+
+# helper: normalize github-ish repo strings into URLs
+# accepts: owner/repo or https://... or git@github.com:owner/repo.git
+to_url() {
+  local s="$1"
+  s="${s%\"}"; s="${s#\"}"
+  s="${s%\'}"; s="${s#\'}"
+  s="${s%.git}"
+
+  if [[ "$s" =~ ^git@github\.com: ]]; then
+    echo "$s" | sed -E 's|^git@github\.com:|https://github.com/|'
+    return 0
+  fi
+
+  if [[ "$s" =~ ^https?:// ]]; then
+    echo "$s"
+    return 0
+  fi
+
+  if [[ "$s" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "https://github.com/$s"
+    return 0
+  fi
+
+  # fallback: return as-is
+  echo "$s"
+}
+
+# Start sources doc
+{
+  echo "# Zsh / Shell External Sources ($ts)"
+  echo
+  echo "Best-effort list of frameworks/plugins/themes and where to download them."
+  echo "Some items are inferred; verify before relying on them."
+  echo
+} > "$ZSH_SOURCES_MD"
+
+# 1) Oh My Zsh core source
+{
+  echo "## Oh My Zsh"
+  echo
+  echo "- repo: https://github.com/ohmyzsh/ohmyzsh"
+  echo
+} >> "$ZSH_SOURCES_MD"
+
+# 2) OMZ theme/plugins detected earlier (THEME / PLUGINS_LINE)
+# (These are paths inside ohmyzsh)
+if [ -n "${THEME:-}" ] && [ "${THEME:-}" != "\"\"" ]; then
+  # strip quotes if any
+  t="$(echo "$THEME" | sed -E 's/^["'\'']|["'\'']$//g')"
+  {
+    echo "- theme (OMZ): $t"
+    echo "  - https://github.com/ohmyzsh/ohmyzsh/tree/master/themes"
+  } >> "$ZSH_SOURCES_MD"
+fi
+
+if [ -n "${PLUGINS_LINE:-}" ]; then
+  {
+    echo
+    echo "## OMZ plugins (as configured)"
+    echo
+  } >> "$ZSH_SOURCES_MD"
+
+  # split on whitespace
+  for p in $PLUGINS_LINE; do
+    p="$(echo "$p" | sed -E 's/^["'\'']|["'\'']$//g')"
+    [ -n "$p" ] || continue
+    {
+      echo "- $p"
+      echo "  - https://github.com/ohmyzsh/ohmyzsh/tree/master/plugins/$p"
+    } >> "$ZSH_SOURCES_MD"
+  done
+fi
+
+# 3) Custom OMZ plugins/themes: record git origins if they’re git repos
+# These are typically your own or third-party you cloned.
+if [ -d "$OUT/shell/omz/custom/plugins" ]; then
+  {
+    echo
+    echo "## Custom OMZ plugins (git origins if available)"
+    echo
+  } >> "$ZSH_SOURCES_MD"
+fi
+
+# Prefer scanning the *real* locations (not the copied snapshot), so we can read .git
+ZSH_CUSTOM_REAL="${ZSH_CUSTOM:-$HOME_DIR/.oh-my-zsh/custom}"
+if [ -d "$ZSH_CUSTOM_REAL/plugins" ]; then
+  for d in "$ZSH_CUSTOM_REAL/plugins"/*; do
+    [ -d "$d" ] || continue
+    record_git_origin "$d"
+  done
+fi
+if [ -d "$ZSH_CUSTOM_REAL/themes" ]; then
+  for d in "$ZSH_CUSTOM_REAL/themes"/*; do
+    [ -d "$d" ] || continue
+    record_git_origin "$d"
+  done
+fi
+
+# 4) Detect common plugin managers + infer bundle URLs from .zshrc
+ZSHRC="$HOME_DIR/.zshrc"
+{
+  echo
+  echo "## Detected plugin managers / bundles (inferred from ~/.zshrc)"
+  echo
+} >> "$ZSH_SOURCES_MD"
+
+if [ -f "$ZSHRC" ]; then
+  # zinit / zi
+  if grep -Eq '(^|\s)(zinit|zi)\s' "$ZSHRC"; then
+    echo "- zinit: https://github.com/zdharma-continuum/zinit" >> "$ZSH_SOURCES_MD"
+    # Common forms:
+    #   zinit light owner/repo
+    #   zi light owner/repo
+    # Extract owner/repo tokens after 'light'/'load'/'snippet' (best-effort)
+    while IFS= read -r repo; do
+      url="$(to_url "$repo")"
+      echo "  - bundle: $url" >> "$ZSH_SOURCES_MD"
+    done < <(
+      sed -nE 's/.*\b(zinit|zi)\s+(light|load)\s+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+).*/\3/p' "$ZSHRC" \
+        | sort -u
+    )
+  fi
+
+  # antigen
+  if grep -Eq '(^|\s)antigen\s' "$ZSHRC"; then
+    echo "- antigen: https://github.com/zsh-users/antigen" >> "$ZSH_SOURCES_MD"
+    while IFS= read -r repo; do
+      url="$(to_url "$repo")"
+      echo "  - bundle: $url" >> "$ZSH_SOURCES_MD"
+    done < <(
+      sed -nE 's/.*\bantigen\s+bundle\s+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+).*/\1/p' "$ZSHRC" \
+        | sort -u
+    )
+  fi
+
+  # zplug
+  if grep -Eq '(^|\s)zplug\s' "$ZSHRC"; then
+    echo "- zplug: https://github.com/zplug/zplug" >> "$ZSH_SOURCES_MD"
+    while IFS= read -r repo; do
+      url="$(to_url "$repo")"
+      echo "  - plugin: $url" >> "$ZSH_SOURCES_MD"
+    done < <(
+      sed -nE 's/.*\bzplug\s+"?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)"?.*/\1/p' "$ZSHRC" \
+        | sort -u
+    )
+  fi
+
+  # zgen / zgenom
+  if grep -Eq '(^|\s)zgen(om)?\s' "$ZSHRC"; then
+    echo "- zgen/zgenom: (check your install path; often in ~/.)" >> "$ZSH_SOURCES_MD"
+    echo "  - zgen: https://github.com/tarjoilija/zgen" >> "$ZSH_SOURCES_MD"
+    echo "  - zgenom: https://github.com/jandamm/zgenom" >> "$ZSH_SOURCES_MD"
+  fi
+
+  # prezto
+  if grep -Eq 'prezto|zprezto' "$ZSHRC"; then
+    echo "- prezto: https://github.com/sorin-ionescu/prezto" >> "$ZSH_SOURCES_MD"
+  fi
+
+  # starship prompt
+  if grep -Eq 'starship\s+init\s+zsh' "$ZSHRC" || [ -f "$HOME_DIR/.config/starship.toml" ]; then
+    echo "- starship: https://github.com/starship/starship" >> "$ZSH_SOURCES_MD"
+  fi
+
+else
+  echo "- (no ~/.zshrc found)" >> "$ZSH_SOURCES_MD"
+fi
+
+# 5) Also scan a few common “shell libs” directories for git origins
+# (You can extend this list as your setup evolves.)
+for candidate in \
+  "$HOME_DIR/.oh-my-zsh" \
+  "$HOME_DIR/.zinit" \
+  "$HOME_DIR/.local/share/zinit" \
+  "$HOME_DIR/.antigen" \
+  "$HOME_DIR/.zplug" \
+  "$HOME_DIR/.zprezto" \
+  "$HOME_DIR/.asdf" \
+  "$HOME_DIR/.nvm" \
+  "$HOME_DIR/.pyenv" \
+  "$HOME_DIR/.rbenv" \
+  "$HOME_DIR/.cargo" \
+  ; do
+  record_git_origin "$candidate"
+done
+
+# De-dupe origins file if present
+if [ -f "$ZSH_GIT_ORIGINS" ]; then
+  sort -u "$ZSH_GIT_ORIGINS" -o "$ZSH_GIT_ORIGINS" || true
+
+  {
+    echo
+    echo "## Local git origins discovered"
+    echo
+    echo "See: \`shell/sources/git-origins.txt\` (path -> origin URL)"
+    echo
+  } >> "$ZSH_SOURCES_MD"
+fi
+
+# -------------------------
+# Env managers / tool versions
+# -------------------------
+log "Capturing env manager configs"
+copy_if_exists "$HOME_DIR/.tool-versions" "$OUT/env/asdf/.tool-versions"
+copy_if_exists "$HOME_DIR/.nvmrc" "$OUT/env/node/.nvmrc"
+copy_if_exists "$HOME_DIR/.npmrc" "$OUT/env/node/.npmrc"
+copy_if_exists "$HOME_DIR/.yarnrc" "$OUT/env/node/.yarnrc"
+copy_if_exists "$HOME_DIR/.yarnrc.yml" "$OUT/env/node/.yarnrc.yml"
+copy_if_exists "$HOME_DIR/.config/pip/pip.conf" "$OUT/env/python/pip.conf"
+copy_if_exists "$HOME_DIR/.pypirc" "$OUT/env/python/.pypirc"
+redact_file_in_place "$OUT/env/node/.npmrc"
+redact_file_in_place "$OUT/env/python/.pypirc"
+
+# -------------------------
+# VS Code / Cursor
+# -------------------------
+log "Capturing VS Code/Cursor settings and extensions"
+copy_if_exists "$HOME_DIR/Library/Application Support/Code/User/settings.json" "$OUT/vscode/settings.json"
+copy_if_exists "$HOME_DIR/Library/Application Support/Code/User/keybindings.json" "$OUT/vscode/keybindings.json"
+copy_if_exists "$HOME_DIR/Library/Application Support/Code/User/snippets" "$OUT/vscode/snippets"
+copy_if_exists "$HOME_DIR/.config/Code/User/settings.json" "$OUT/vscode/settings.json"
+copy_if_exists "$HOME_DIR/.config/Code/User/keybindings.json" "$OUT/vscode/keybindings.json"
+copy_if_exists "$HOME_DIR/.config/Code/User/snippets" "$OUT/vscode/snippets"
+run_if_cmd code "$OUT/vscode/extensions.txt" --list-extensions
+
+copy_if_exists "$HOME_DIR/Library/Application Support/Cursor/User/settings.json" "$OUT/cursor/settings.json"
+copy_if_exists "$HOME_DIR/Library/Application Support/Cursor/User/keybindings.json" "$OUT/cursor/keybindings.json"
+copy_if_exists "$HOME_DIR/Library/Application Support/Cursor/User/snippets" "$OUT/cursor/snippets"
+run_if_cmd cursor "$OUT/cursor/extensions.txt" --list-extensions
+
+redact_file_in_place "$OUT/vscode/settings.json"
+redact_file_in_place "$OUT/cursor/settings.json"
+
+# -------------------------
+# Brew + Brewfile + MAS
+# -------------------------
+log "Capturing Homebrew inventories and Brewfile"
+run_if_cmd brew "$OUT/brew/brew-config.txt" config
+run_if_cmd brew "$OUT/brew/brew-list.txt" list --versions
+run_if_cmd brew "$OUT/brew/brew-cask.txt" list --cask --versions
+
+if command -v brew >/dev/null 2>&1; then
+  mkdir -p "$OUT/brew"
+  # Brewfile is the closest thing to "declarative restore"
+  ( cd "$OUT/brew" && brew bundle dump --force --describe ) >"$OUT/brew/brew-bundle-dump.log" 2>&1 || true
+fi
+
+# Mac App Store apps via mas (if installed)
+run_if_cmd mas "$OUT/macos/mas-list.txt" list
+
+# -------------------------
+# Toolchain versions
+# -------------------------
+log "Capturing toolchain versions"
+run_if_cmd node "$OUT/env/node/node-version.txt" --version
+run_if_cmd npm "$OUT/env/node/npm-version.txt" --version
+run_if_cmd npm "$OUT/env/node/npm-global.txt" -g list --depth=0
+run_if_cmd python3 "$OUT/env/python/python3-version.txt" --version
+run_if_cmd pip3 "$OUT/env/python/pip3-freeze.txt" freeze
+run_if_cmd rustc "$OUT/env/rust/rustc-version.txt" --version
+run_if_cmd cargo "$OUT/env/rust/cargo-version.txt" --version
+run_if_cmd rustup "$OUT/env/rust/rustup-show.txt" show
+run_if_cmd go "$OUT/env/go/go-version.txt" version
+run_if_cmd go "$OUT/env/go/go-env.txt" env
+run_if_cmd terraform "$OUT/terraform/version.txt" version
+run_if_cmd docker "$OUT/docker/docker-version.txt" --version
+run_if_cmd docker "$OUT/docker/docker-info.txt" info
+
+# -------------------------
+# GPG / Git signing metadata (no private keys)
+# -------------------------
+log "Capturing GPG metadata (no private keys)"
+run_if_cmd gpg "$OUT/gpg/keys-public.txt" --list-public-keys --keyid-format=long
+run_if_cmd gpg "$OUT/gpg/keys-secret-stubs.txt" --list-secret-keys --keyid-format=long
+# On some systems, list-secret-keys can still be sensitive-ish; you can delete that file if you hate it.
+
+# -------------------------
+# macOS dev-ish defaults (lightweight)
+# -------------------------
+if [ "${OS:-}" = "Darwin" ]; then
+  log "Capturing a few macOS defaults (lightweight)"
+  run_if_cmd defaults "$OUT/macos/defaults-com.apple.Terminal.txt" read com.apple.Terminal
+  run_if_cmd defaults "$OUT/macos/defaults-com.googlecode.iterm2.txt" read com.googlecode.iterm2
+  run_if_cmd defaults "$OUT/macos/defaults-com.microsoft.VSCode.txt" read com.microsoft.VSCode
+fi
+
+# -------------------------
+# Repo-local git configs scan
+# -------------------------
+log "Scanning for repo-local .git/config (best-effort)"
+SCAN_ROOTS="${SCAN_ROOTS:-$HOME_DIR/dev $HOME_DIR/src $HOME_DIR/projects $HOME_DIR/Documents}"
+mkdir -p "$OUT/git/repo-local"
+
+for root in $SCAN_ROOTS; do
+  [ -d "$root" ] || continue
+  while IFS= read -r cfg; do
+    repo_dir="$(dirname "$(dirname "$cfg")")"
+    safe_name="$(echo "$repo_dir" | sed 's|^'"$HOME_DIR"'|~|; s|/|__|g; s|[^A-Za-z0-9_.~-]|_|g')"
+    dest="$OUT/git/repo-local/${safe_name}__gitconfig"
+    cp -a "$cfg" "$dest" 2>/dev/null || true
+    redact_file_in_place "$dest"
+  done < <(find "$root" \
+    -type d \( -name node_modules -o -name .cache -o -name dist -o -name build \) -prune \
+    -o -type f -path "*/.git/config" -print 2>/dev/null)
+done
+
+# -------------------------
+# README
+# -------------------------
+cat > "$OUT/README.md" <<EOF
+# Dev Config Snapshot ($ts)
+
+This folder contains:
+- Git config (global/system + files) and repo-local .git/config snapshots
+- SSH config (public bits only; NO private keys)
+- Shell raw dotfiles + a "Zsh essence" extraction for declarative rebuild
+- Oh My Zsh metadata + custom themes/plugins
+- VS Code/Cursor settings + extension lists
+- Toolchain inventories (brew, npm, pip, rustup, go, terraform, docker)
+- Brewfile generated via \`brew bundle dump\` (best restore experience)
+- Optional macOS defaults for a few dev apps
+
+## Safety
+This is best-effort redacted but NOT guaranteed. Review before sharing.
+
+## Restore workflow (suggested)
+1) Brew: \`brew bundle --file ./brew/Brewfile\`
+2) VS Code: re-install extensions from ./vscode/extensions.txt
+3) Git: restore ~/.gitconfig and any included files
+4) Zsh: use ./shell/essence/zshrc-essence.md as your rebuild recipe
+EOF
+
+log "Done."
+echo "$OUT"
