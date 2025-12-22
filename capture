@@ -38,6 +38,9 @@ redact_file_in_place() {
     s/(\btoken\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
     s/(\bpassword\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
     s/(\bsecret\b\s*[:=]\s*)[^\s"\x27]+/$1[REDACTED]/gi;
+    s/(\bapi[_-]?key\b\s*[:=]\s*)[^\s"\x27&]+/$1[REDACTED]/gi;
+    s/(AKIA[0-9A-Z]{16})/[REDACTED_AWS_KEY]/g;
+    s/([?&]api[_-]?key=)[^&\s"\x27]+/$1[REDACTED]/gi;
     s/-----BEGIN (?:OPENSSH|RSA|EC|DSA|PRIVATE) KEY-----.+?-----END (?:OPENSSH|RSA|EC|DSA|PRIVATE) KEY-----/-----BEGIN PRIVATE KEY-----\n[REDACTED]\n-----END PRIVATE KEY-----/gs;
   ' "$f" 2>/dev/null || true
 }
@@ -74,13 +77,34 @@ copy_if_exists "$HOME_DIR/.ssh/known_hosts" "$OUT/ssh/known_hosts"
 copy_if_exists "$HOME_DIR/.ssh/authorized_keys" "$OUT/ssh/authorized_keys"
 if [ -d "$HOME_DIR/.ssh" ]; then
   mkdir -p "$OUT/ssh/public_keys"
-  shopt -s nullglob
   for pub in "$HOME_DIR/.ssh/"*.pub; do
+    [ -f "$pub" ] || continue  # Skip if no .pub files exist
     cp -a "$pub" "$OUT/ssh/public_keys/" 2>/dev/null || true
   done
-  shopt -u nullglob
 fi
 redact_file_in_place "$OUT/ssh/config"
+
+# -------------------------
+# Tmux
+# -------------------------
+log "Capturing tmux configuration"
+copy_if_exists "$HOME_DIR/.tmux.conf" "$OUT/tmux/.tmux.conf"
+copy_if_exists "$HOME_DIR/.config/tmux/tmux.conf" "$OUT/tmux/tmux.conf"
+
+# -------------------------
+# Vim / Neovim
+# -------------------------
+log "Capturing vim/nvim configuration"
+copy_if_exists "$HOME_DIR/.vimrc" "$OUT/vim/.vimrc"
+copy_if_exists "$HOME_DIR/.vim" "$OUT/vim/.vim"
+copy_if_exists "$HOME_DIR/.config/nvim" "$OUT/nvim"
+
+# -------------------------
+# Kubernetes (redacted)
+# -------------------------
+log "Capturing Kubernetes config (redacted)"
+copy_if_exists "$HOME_DIR/.kube/config" "$OUT/kubernetes/config"
+redact_file_in_place "$OUT/kubernetes/config"
 
 # -------------------------
 # Shell / Zsh / Oh-My-Zsh
@@ -511,6 +535,8 @@ fi
 # Repo-local git configs scan
 # -------------------------
 log "Scanning for repo-local .git/config (best-effort)"
+# SCAN_ROOTS: space-separated list of directories to scan for git repos.
+# Override via environment: SCAN_ROOTS="/path1 /path2" ./capture
 SCAN_ROOTS="${SCAN_ROOTS:-$HOME_DIR/dev $HOME_DIR/src $HOME_DIR/projects $HOME_DIR/Documents}"
 mkdir -p "$OUT/git/repo-local"
 
@@ -536,6 +562,8 @@ cat > "$OUT/README.md" <<EOF
 This folder contains:
 - Git config (global/system + files) and repo-local .git/config snapshots
 - SSH config (public bits only; NO private keys)
+- Tmux, Vim/Neovim configuration files
+- Kubernetes config (redacted)
 - Shell raw dotfiles + a "Zsh essence" extraction for declarative rebuild
 - Oh My Zsh metadata + custom themes/plugins
 - VS Code/Cursor settings + extension lists
@@ -544,7 +572,7 @@ This folder contains:
 - Optional macOS defaults for a few dev apps
 
 ## Safety
-This is best-effort redacted but NOT guaranteed. Review before sharing.
+This is best-effort redacted (tokens, passwords, secrets, AWS keys, API keys, private keys) but NOT guaranteed. **Always review before sharing.**
 
 ## Restore workflow (suggested)
 1) Brew: \`brew bundle --file ./brew/Brewfile\`

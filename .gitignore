@@ -1,0 +1,22 @@
+# Snapshot outputs - these contain sensitive data!
+dev-config-snapshot-*/
+snapshots/
+backups/
+*.tar.gz
+*.zip
+
+# Common snapshot output patterns
+*-snapshot-*
+*-backup-*
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
