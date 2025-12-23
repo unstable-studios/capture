@@ -1,15 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Default values
+DRY_RUN=false
+OUTPUT_DIR=""
+
+# Usage information
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [OUTPUT_DIR]
+
+Capture development environment configuration for backup or migration.
+
+OPTIONS:
+  -d, --dry-run    Show what would be captured without actually doing it
+  -h, --help       Display this help message
+  
+ARGUMENTS:
+  OUTPUT_DIR       Directory to save snapshot (default: ./dev-config-snapshot-TIMESTAMP)
+
+EXAMPLES:
+  $(basename "$0")                        # Create snapshot in current directory
+  $(basename "$0") ~/backups/config       # Create snapshot in specific location
+  $(basename "$0") --dry-run              # Preview what would be captured
+  SCAN_ROOTS="~/work ~/personal" $(basename "$0")  # Custom git repo scan paths
+
+EOF
+  exit 0
+}
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -d|--dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -*)
+      echo "Error: Unknown option: $1"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+    *)
+      # First non-option argument is the output directory
+      OUTPUT_DIR="$1"
+      shift
+      ;;
+  esac
+done
+
 ts="$(date +"%Y%m%d-%H%M%S")"
-OUT="${1:-$PWD/dev-config-snapshot-$ts}"
+OUT="${OUTPUT_DIR:-$PWD/dev-config-snapshot-$ts}"
+
+if [ "$DRY_RUN" = true ]; then
+  echo "==> DRY RUN MODE - No files will be created"
+  echo
+fi
+
 mkdir -p "$OUT"
 
-log() { printf "\n==> %s\n" "$*"; }
+log() { 
+  if [ "$DRY_RUN" = true ]; then
+    printf "\n[DRY RUN] ==> %s\n" "$*"
+  else
+    printf "\n==> %s\n" "$*"
+  fi
+}
 
 copy_if_exists() {
   local src="$1"
   local dest="$2"
+  if [ "$DRY_RUN" = true ]; then
+    [ -e "$src" ] && echo "  Would copy: $src -> $dest"
+    return 0
+  fi
   if [ -e "$src" ]; then
     mkdir -p "$(dirname "$dest")"
     if command -v rsync >/dev/null 2>&1; then
@@ -24,6 +91,10 @@ run_if_cmd() {
   local cmd="$1"
   local outfile="$2"
   shift 2 || true
+  if [ "$DRY_RUN" = true ]; then
+    command -v "$cmd" >/dev/null 2>&1 && echo "  Would run: $cmd $* > $outfile"
+    return 0
+  fi
   if command -v "$cmd" >/dev/null 2>&1; then
     mkdir -p "$(dirname "$outfile")"
     ( "$cmd" "$@" ) >"$outfile" 2>&1 || true
@@ -32,6 +103,7 @@ run_if_cmd() {
 
 redact_file_in_place() {
   local f="$1"
+  [ "$DRY_RUN" = true ] && return 0
   [ -f "$f" ] || return 0
   perl -0777 -i -pe '
     s/(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/$1[REDACTED]/gi;
@@ -48,10 +120,14 @@ redact_file_in_place() {
 OS="$(uname -s || true)"
 HOME_DIR="${HOME:-}"
 
-log "Writing snapshot to: $OUT"
-printf "timestamp=%s\nos=%s\nhostname=%s\nuser=%s\n" \
-  "$ts" "$OS" "$(hostname 2>/dev/null || true)" "$(whoami 2>/dev/null || true)" \
-  > "$OUT/metadata.txt"
+if [ "$DRY_RUN" = false ]; then
+  log "Writing snapshot to: $OUT"
+  printf "timestamp=%s\nos=%s\nhostname=%s\nuser=%s\n" \
+    "$ts" "$OS" "$(hostname 2>/dev/null || true)" "$(whoami 2>/dev/null || true)" \
+    > "$OUT/metadata.txt"
+else
+  log "Would write snapshot to: $OUT"
+fi
 
 # -------------------------
 # Git
@@ -110,7 +186,9 @@ redact_file_in_place "$OUT/kubernetes/config"
 # Shell / Zsh / Oh-My-Zsh
 # -------------------------
 log "Capturing shell configuration (raw + declarative essence)"
-mkdir -p "$OUT/shell/raw" "$OUT/shell/essence" "$OUT/shell/omz"
+if [ "$DRY_RUN" = false ]; then
+  mkdir -p "$OUT/shell/raw" "$OUT/shell/essence" "$OUT/shell/omz"
+fi
 
 # Raw dotfiles (forensics)
 copy_if_exists "$HOME_DIR/.bashrc" "$OUT/shell/raw/.bashrc"
@@ -227,7 +305,9 @@ redact_file_in_place "$ESS"
 # Source URLs for external libs/plugins (best-effort)
 # -------------------------
 log "Capturing source URLs for external shell libs/plugins (best-effort)"
-mkdir -p "$OUT/shell/sources"
+if [ "$DRY_RUN" = false ]; then
+  mkdir -p "$OUT/shell/sources"
+fi
 
 ZSH_SOURCES_MD="$OUT/shell/sources/zsh-sources.md"
 ZSH_GIT_ORIGINS="$OUT/shell/sources/git-origins.txt"
@@ -235,6 +315,7 @@ ZSH_GIT_ORIGINS="$OUT/shell/sources/git-origins.txt"
 # helper: if dir is a git repo, record its origin
 record_git_origin() {
   local dir="$1"
+  [ "$DRY_RUN" = true ] && return 0
   [ -d "$dir" ] || return 0
   if [ -d "$dir/.git" ] || git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     local origin
@@ -487,9 +568,13 @@ run_if_cmd brew "$OUT/brew/brew-list.txt" list --versions
 run_if_cmd brew "$OUT/brew/brew-cask.txt" list --cask --versions
 
 if command -v brew >/dev/null 2>&1; then
-  mkdir -p "$OUT/brew"
-  # Brewfile is the closest thing to "declarative restore"
-  ( cd "$OUT/brew" && brew bundle dump --force --describe ) >"$OUT/brew/brew-bundle-dump.log" 2>&1 || true
+  if [ "$DRY_RUN" = false ]; then
+    mkdir -p "$OUT/brew"
+    # Brewfile is the closest thing to "declarative restore"
+    ( cd "$OUT/brew" && brew bundle dump --force --describe ) >"$OUT/brew/brew-bundle-dump.log" 2>&1 || true
+  else
+    echo "  Would run: brew bundle dump in $OUT/brew"
+  fi
 fi
 
 # Mac App Store apps via mas (if installed)
@@ -538,10 +623,16 @@ log "Scanning for repo-local .git/config (best-effort)"
 # SCAN_ROOTS: space-separated list of directories to scan for git repos.
 # Override via environment: SCAN_ROOTS="/path1 /path2" ./capture
 SCAN_ROOTS="${SCAN_ROOTS:-$HOME_DIR/dev $HOME_DIR/src $HOME_DIR/projects $HOME_DIR/Documents}"
-mkdir -p "$OUT/git/repo-local"
+if [ "$DRY_RUN" = false ]; then
+  mkdir -p "$OUT/git/repo-local"
+fi
 
 for root in $SCAN_ROOTS; do
   [ -d "$root" ] || continue
+  if [ "$DRY_RUN" = true ]; then
+    echo "  Would scan: $root for .git/config files"
+    continue
+  fi
   while IFS= read -r cfg; do
     repo_dir="$(dirname "$(dirname "$cfg")")"
     safe_name="$(echo "$repo_dir" | sed 's|^'"$HOME_DIR"'|~|; s|/|__|g; s|[^A-Za-z0-9_.~-]|_|g')"
@@ -556,7 +647,8 @@ done
 # -------------------------
 # README
 # -------------------------
-cat > "$OUT/README.md" <<EOF
+if [ "$DRY_RUN" = false ]; then
+  cat > "$OUT/README.md" <<EOF
 # Dev Config Snapshot ($ts)
 
 This folder contains:
@@ -580,6 +672,13 @@ This is best-effort redacted (tokens, passwords, secrets, AWS keys, API keys, pr
 3) Git: restore ~/.gitconfig and any included files
 4) Zsh: use ./shell/essence/zshrc-essence.md as your rebuild recipe
 EOF
+fi
 
 log "Done."
-echo "$OUT"
+if [ "$DRY_RUN" = true ]; then
+  echo
+  echo "This was a dry run. No files were created."
+  echo "Run without --dry-run to actually capture your configuration."
+else
+  echo "$OUT"
+fi
