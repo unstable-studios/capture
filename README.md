@@ -267,7 +267,7 @@ Suggestions for improvement:
 
 ## License
 
-MIT License - See LICENSE file
+AGPL 3.0
 
 ## Related Tools
 
