@@ -1,0 +1,6 @@
+[capture.providers]
+brew = capture.plugins.brew:get_provider
+git = capture.plugins.git:get_provider
+
+[console_scripts]
+capture = capture.__main__:app

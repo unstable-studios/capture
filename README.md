@@ -1,74 +1,114 @@
-# Dev Config Capture
+# Capture — Modular Python CLI
 
-A comprehensive tool to snapshot your development environment configuration for backup, migration, or team onboarding purposes.
+A Typer-based CLI to snapshot, verify, and restore development environment state on macOS, with pluggable providers (brew, git, etc.).
 
-## What It Captures
-
-- **Git**: Global/system config, repo-local configs
-- **SSH**: Config files, public keys (NO private keys)
-- **Shell**: Dotfiles (`.zshrc`, `.bashrc`, etc.) + declarative "essence" extraction
-- **Oh My Zsh**: Theme, plugins, custom additions + source URLs for reinstallation
-- **Plugin Managers**: Detects zinit, antigen, zplug, zgen/zgenom, prezto
-- **Editors**: VS Code & Cursor settings, keybindings, snippets, extensions
-- **Terminal Tools**: Tmux, Vim/Neovim configurations
-- **Package Managers**: Homebrew (`Brewfile`), npm, pip, rustup, cargo
-- **Toolchains**: Node, Python, Rust, Go, Terraform, Docker versions
-- **Environment Managers**: asdf, nvm, pyenv, rbenv configs
-- **Kubernetes**: Config (redacted)
-- **macOS**: App defaults, Mac App Store apps (via `mas`)
-- **GPG**: Public key listings (NO private keys)
-
-## Quick Start
+## Install (dev)
 
 ```bash
-# Basic usage - creates snapshot in current directory
-./capture
-
-# Specify custom output directory
-./capture ~/my-backup-2025
-
-# Override which directories to scan for git repos
-SCAN_ROOTS="$HOME/work $HOME/personal" ./capture
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
 ```
 
-## Output Structure
+## Usage
 
+Single-command CLI: capture and verify are always safe (read-only), restore requires explicit `--apply` flag.
+
+```bash
+# List providers
+capture --list-providers
+
+# Capture all providers (creates snapshot)
+capture --output-dir snapshots
+
+# Capture selected providers
+capture --include brew,git --output-dir snapshots
+
+# Show snapshot summary
+capture --show --input-dir snapshots/dev-config-snapshot-YYYYMMDD-HHMMSS
+
+# Verify an existing snapshot
+capture --verify --input-dir snapshots/dev-config-snapshot-YYYYMMDD-HHMMSS
+
+# Preview restore (safe, no changes)
+capture --restore --input-dir snapshots/dev-config-snapshot-YYYYMMDD-HHMMSS
+
+# Apply restore (use --apply to actually make changes)
+capture --restore --apply --input-dir snapshots/dev-config-snapshot-YYYYMMDD-HHMMSS
 ```
-dev-config-snapshot-20251222-143055/
-├── README.md                    # Overview of snapshot
-├── metadata.txt                 # Timestamp, OS, hostname, user
-├── git/                         # Git configuration
-│   ├── config--global.txt
-│   ├── files/.gitconfig
-│   └── repo-local/              # Individual repo configs
-├── ssh/                         # SSH config (public only)
-│   ├── config
-│   └── public_keys/
-├── shell/                       # Shell configuration
-│   ├── raw/                     # Original dotfiles
-│   ├── essence/                 # Declarative rebuild recipes
-│   │   └── zshrc-essence.md
-│   ├── omz/                     # Oh My Zsh metadata
-│   └── sources/                 # Plugin/theme source URLs
-│       ├── zsh-sources.md
-│       └── git-origins.txt
+
+### Common Flags
+
+- `--include`: comma-separated provider names to include (default: all)
+- `--exclude`: comma-separated provider names to skip
+- `--output-dir` / `-o`: base directory to write captured snapshots
+- `--input-dir` / `-i`: path to an existing snapshot for verify/restore/show
+- `--snapshot-name`: override generated snapshot name
+- `--format`: metadata format (`json`)
+- `-v/--verbose`: increase verbosity
+
+### Safety Guarantees
+
+- **Capture**: Always safe, only reads from system and writes to snapshot directory
+- **Verify**: Always safe, only reads and compares
+- **Restore**: Preview mode by default (no changes), requires explicit `--apply` flag to modify system
+
+## Providers
+
+- `brew`: Homebrew version, installed packages, config; dumps `Brewfile` on non-dry-run.
+- `git`: Git version and config (global/list/system); restore is manual by design.
+- Upcoming: docker, env (node/python/rust), vscode, macos defaults, shell, ssh, gpg, terraform.
+
+## Plugin Authoring
+
+Providers implement the `Provider` protocol: `name`, `capture(ctx)`, `verify(ctx)`, `restore(ctx)`.
+Third-party plugins register via the `capture.providers` entry point group and expose `get_provider()`.
+
+Example `pyproject.toml` entry:
+
+```toml
+[project.entry-points."capture.providers"]
+myprovider = "my_package.my_module:get_provider"
+```
+
+## Snapshot Layout
+
+Snapshots are created under your `--output-dir` in a folder named `dev-config-snapshot-YYYYMMDD-HHMMSS` containing `metadata.json` and per-provider subfolders with `result.json` and any additional files.
+├── README.md # Overview of snapshot
+├── metadata.txt # Timestamp, OS, hostname, user
+├── git/ # Git configuration
+│ ├── config--global.txt
+│ ├── files/.gitconfig
+│ └── repo-local/ # Individual repo configs
+├── ssh/ # SSH config (public only)
+│ ├── config
+│ └── public_keys/
+├── shell/ # Shell configuration
+│ ├── raw/ # Original dotfiles
+│ ├── essence/ # Declarative rebuild recipes
+│ │ └── zshrc-essence.md
+│ ├── omz/ # Oh My Zsh metadata
+│ └── sources/ # Plugin/theme source URLs
+│ ├── zsh-sources.md
+│ └── git-origins.txt
 ├── tmux/
 ├── vim/ & nvim/
 ├── kubernetes/
-├── vscode/                      # VS Code settings
-│   ├── settings.json
-│   ├── extensions.txt
-│   └── snippets/
-├── cursor/                      # Cursor editor settings
-├── brew/                        # Homebrew
-│   ├── Brewfile                 # ⭐ Key file for restore
-│   └── brew-list.txt
-├── env/                         # Environment managers
-│   ├── asdf/.tool-versions
-│   ├── node/.npmrc
-│   └── python/pip.conf
+├── vscode/ # VS Code settings
+│ ├── settings.json
+│ ├── extensions.txt
+│ └── snippets/
+├── cursor/ # Cursor editor settings
+├── brew/ # Homebrew
+│ ├── Brewfile # ⭐ Key file for restore
+│ └── brew-list.txt
+├── env/ # Environment managers
+│ ├── asdf/.tool-versions
+│ ├── node/.npmrc
+│ └── python/pip.conf
 └── docker/
-```
+
+````
 
 ## Restoration Workflow
 
@@ -83,7 +123,7 @@ brew bundle install --file ./brew/Brewfile
 
 # Mac App Store apps (if mas is installed)
 # Review ./macos/mas-list.txt and install manually or via mas
-```
+````
 
 ### 2. Git Configuration
 

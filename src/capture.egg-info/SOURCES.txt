@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+src/capture/__init__.py
+src/capture/__main__.py
+src/capture/context.py
+src/capture/loader.py
+src/capture/provider.py
+src/capture.egg-info/PKG-INFO
+src/capture.egg-info/SOURCES.txt
+src/capture.egg-info/dependency_links.txt
+src/capture.egg-info/entry_points.txt
+src/capture.egg-info/requires.txt
+src/capture.egg-info/top_level.txt
+src/capture/plugins/__init__.py
+src/capture/plugins/brew.py
+src/capture/plugins/git.py
