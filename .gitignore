@@ -20,3 +20,7 @@ backups/
 *.swp
 *.swo
 *~
+
+# Python cache files
+__pycache__/
+**/__pycache__/
