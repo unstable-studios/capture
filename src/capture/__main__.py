@@ -80,6 +80,41 @@ def main(
             else:
                 provider_table.add_row(provider_name, "[red]✗[/red]")
         console.print(provider_table)
+        
+        # Show git analysis if available
+        git_analysis_path = input_dir / "git" / "analysis.json"
+        if git_analysis_path.exists():
+            analysis = json.loads(git_analysis_path.read_text())
+            git_table = Table(title="Git: Global Config Candidates")
+            git_table.add_column("Config Key", style="yellow")
+            git_table.add_column("Value")
+            git_table.add_column("Repos", justify="right")
+            
+            candidates = analysis.get("global_candidates", {})
+            # Filter to interesting candidates (not core git internals, used in multiple repos)
+            skip_keys = {"core.repositoryformatversion", "core.filemode", "core.bare", 
+                        "core.logallrefupdates", "core.ignorecase", "core.precomposeunicode"}
+            skip_prefixes = ("remote.", "branch.", "submodule.")
+            interesting = {k: v for k, v in candidates.items() 
+                          if k not in skip_keys 
+                          and not any(k.startswith(p) for p in skip_prefixes)
+                          and v["repo_count"] >= 2}
+            
+            if interesting:
+                for key, info in sorted(interesting.items(), key=lambda x: -x[1]["repo_count"]):
+                    git_table.add_row(key, info["value"], f"{info['repo_count']}/{info['total_repos']}")
+                console.print(git_table)
+                console.print(f"[dim]Found {analysis['total_repos']} repos. Promotion commands available in analysis.json[/dim]")
+                
+                # Show promotion commands if available
+                promo_cmds = analysis.get("promotion_commands", [])
+                if promo_cmds:
+                    console.print("\n[cyan]To promote common settings to global config:[/cyan]")
+                    for cmd in promo_cmds[:5]:  # Show first 5
+                        console.print(f"  [dim]{cmd}[/dim]")
+                    if len(promo_cmds) > 5:
+                        console.print(f"  [dim]... and {len(promo_cmds) - 5} more in analysis.json[/dim]")
+        
         raise typer.Exit(code=0)
 
     if verify:
