@@ -151,9 +151,9 @@ fi
 # -------------------------
 log "Capturing Git configuration"
 run_if_cmd git "$OUT/git/version.txt" --version
-run_if_cmd git "$OUT/git/config--global.txt" config --global --list --show-origin
-run_if_cmd git "$OUT/git/config--system.txt" config --system --list --show-origin
-run_if_cmd git "$OUT/git/config--list.txt" config --list --show-origin
+run_if_cmd git "$OUT/git/config--global.txt" config --global --list --show-origin --show-scope
+run_if_cmd git "$OUT/git/config--system.txt" config --system --list --show-origin --show-scope
+run_if_cmd git "$OUT/git/config--list.txt" config --list --show-origin --show-scope
 copy_if_exists "$HOME_DIR/.gitconfig" "$OUT/git/files/.gitconfig"
 copy_if_exists "$HOME_DIR/.config/git/config" "$OUT/git/files/.config/git/config"
 copy_if_exists "/etc/gitconfig" "$OUT/git/files/etc-gitconfig"
@@ -640,22 +640,28 @@ log "Scanning for repo-local .git/config (best-effort)"
 # SCAN_ROOTS: space-separated list of directories to scan for git repos.
 # Override via environment: SCAN_ROOTS="/path1 /path2" ./capture
 SCAN_ROOTS="${SCAN_ROOTS:-$HOME_DIR/dev $HOME_DIR/src $HOME_DIR/projects $HOME_DIR/Documents}"
+XDG_CONFIG_HOME_DEFAULT="${XDG_CONFIG_HOME:-$HOME_DIR/.config}"
 if [ "$DRY_RUN" = false ]; then
-  mkdir -p "$OUT/git/repo-local"
+  mkdir -p "$OUT/git/repo-local" "$OUT/git/repo-local/list"
 fi
 
 for root in $SCAN_ROOTS; do
   [ -d "$root" ] || continue
   if [ "$DRY_RUN" = true ]; then
-    echo "  Would scan: $root for .git/config files"
+    echo "  Would scan: $root for .git/config files and resolved config lists"
     continue
   fi
   while IFS= read -r cfg; do
     repo_dir="$(dirname "$(dirname "$cfg")")"
     safe_name="$(echo "$repo_dir" | sed 's|^'"$HOME_DIR"'|~|; s|/|__|g; s|[^A-Za-z0-9_.~-]|_|g')"
     dest="$OUT/git/repo-local/${safe_name}__gitconfig"
+    list_dest="$OUT/git/repo-local/list/${safe_name}__config-list.txt"
+
     cp -a "$cfg" "$dest" 2>/dev/null || true
+    env HOME="$HOME_DIR" XDG_CONFIG_HOME="$XDG_CONFIG_HOME_DEFAULT" git -C "$repo_dir" config --list --show-origin --show-scope > "$list_dest" 2>/dev/null || true
+
     redact_file_in_place "$dest"
+    redact_file_in_place "$list_dest"
   done < <(find "$root" \
     -type d \( -name node_modules -o -name .cache -o -name dist -o -name build \) -prune \
     -o -type f -path "*/.git/config" -print 2>/dev/null)
@@ -669,7 +675,7 @@ if [ "$DRY_RUN" = false ]; then
 # Dev Config Snapshot ($ts)
 
 This folder contains:
-- Git config (global/system + files) and repo-local .git/config snapshots
+- Git config (global/system + files), repo-local .git/config snapshots, and resolved per-repo config lists
 - SSH config (public bits only; NO private keys)
 - Tmux, Vim/Neovim configuration files
 - Kubernetes config (redacted)
