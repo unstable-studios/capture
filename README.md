@@ -1,3 +1,5 @@
+> **Archived 2026-11-19.** Superseded by chezmoi: mkhnsn/dotfiles (Brewfile, mac-setup, app-prefs) captures and applies the workstation setup. See echo-core decision 0001.
+
 # Capture — Modular Python CLI
 
 A Typer-based CLI to snapshot, verify, and restore development environment state on macOS, with pluggable providers (brew, git, etc.).
